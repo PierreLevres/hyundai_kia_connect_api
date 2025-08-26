@@ -7,6 +7,7 @@ import random
 import datetime as dt
 import logging
 import uuid
+import re
 from urllib.parse import parse_qs, urlparse
 
 import pytz
@@ -100,7 +101,7 @@ class KiaUvoApiEU(ApiImplType1):
             self.BASIC_AUTHORIZATION: str = (
                 "Basic ZmRjODVjMDAtMGEyZi00YzY0LWJjYjQtMmNmYjE1MDA3MzBhOnNlY3JldA=="
             )
-            self.LOGIN_FORM_HOST = "eu-account.kia.com"
+            self.LOGIN_FORM_HOST = "https://idpconnect-eu.kia.com"
             self.PUSH_TYPE = "APNS"
         elif BRANDS[self.brand] == BRAND_HYUNDAI:
             self.BASE_DOMAIN: str = "prd.eu-ccapi.hyundai.com"
@@ -134,17 +135,16 @@ class KiaUvoApiEU(ApiImplType1):
         self.GCM_SENDER_ID = 199360397125
 
         if BRANDS[self.brand] == BRAND_KIA:
-            auth_client_id = "572e0304-5f8d-4b4c-9dd5-41aa84eed160"
+            auth_client_id = "fdc85c00-0a2f-4c64-bcb4-2cfb1500730a"
             self.LOGIN_FORM_URL: str = (
-                "https://"
-                + self.LOGIN_FORM_HOST
-                + "/auth/realms/eukiaidm/protocol/openid-connect/auth?client_id="
+                self.LOGIN_FORM_HOST
+                + "/auth/api/v2/user/oauth2/authorize?response_type=code&client_id="
                 + auth_client_id
-                + "&scope=openid%20profile%20email%20phone&response_type=code&hkid_session_reset=true&redirect_uri="  # noqa
+                + "&redirect_uri="
                 + self.USER_API_URL
-                + "integration/redirect/login&ui_locales="
+                + "oauth2/redirect&lang="
                 + self.LANGUAGE
-                + "&state=$service_id:$user_id"
+                + "&state=ccsp"
             )
         elif BRANDS[self.brand] == BRAND_HYUNDAI:
             auth_client_id = "64621b96-0f0d-11ec-82a8-0242ac130003"
@@ -1092,16 +1092,122 @@ class KiaUvoApiEU(ApiImplType1):
     def _get_authorization_code_with_redirect_url(
         self, username, password, cookies
     ) -> str:
-        url = self.USER_API_URL + "signin"
-        headers = {"Content-type": "application/json"}
-        data = {"email": username, "password": password}
-        response = requests.post(
-            url, json=data, headers=headers, cookies=cookies
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Sign In Response: {response}")
-        parsed_url = urlparse(response["redirectUrl"])
-        authorization_code = "".join(parse_qs(parsed_url.query)["code"])
-        return authorization_code
+        if BRANDS[self.brand] == BRAND_HYUNDAI:
+            url = self.USER_API_URL + "signin"
+            headers = {"Content-type": "application/json"}
+            data = {"email": username, "password": password}
+            response = requests.post(
+                url, json=data, headers=headers, cookies=cookies
+            ).json()
+            _LOGGER.debug(f"{DOMAIN} - Sign In Response: {response}")
+            parsed_url = urlparse(response["redirectUrl"])
+            authorization_code = "".join(parse_qs(parsed_url.query)["code"])
+            return authorization_code
+        elif BRANDS[self.brand] == BRAND_KIA:
+            session = requests.session()
+            session.headers.update({"User-Agent": USER_AGENT_MOZILLA})
+            url = self.LOGIN_FORM_HOST + "/auth/account/signin"
+            headers = {"content-type": "application/x-www-form-urlencoded"}
+            data = {
+                "client_id": "peukiaidm-online-sales",
+                "encryptedPassword": "false",
+                "username": username,
+                "password": password,
+                "redirect_uri": "https://www.kia.com/api/bin/oneid/login",
+                "state": "aHR0cHM6Ly93d3cua2lhLmNvbTo0NDMvZGUvP3ZlZD0yYWhVS0V3akI2ZFc3dDQtUEF4WFBSZkVESGNDQ0J4UVFnVTk2QkFnY0VBZyZfdG09MTc1NTg1NTY2ODE2Mg==_default",
+                "remember_me": "false",
+            }
+            response = session.post(url, headers=headers, data=data, cookies=cookies)
+
+            device_id = self._get_device_id(self._get_stamp())
+
+            # Authorize
+            url = (
+                self.LOGIN_FORM_HOST
+                + "/auth/api/v2/user/oauth2/authorize?response_type=code&client_id="
+                + self.CCSP_SERVICE_ID
+                + "&redirect_uri=https://"
+                + self.BASE_URL
+                + "/api/v1/user/oauth2/redirect&state=ccsp&lang=en"
+            )
+            headers = {
+                "ccsp-application-id": self.APP_ID,
+                "ccsp-service-id": self.CCSP_SERVICE_ID,
+                "ccsp-device-id": device_id,
+            }
+            response = session.get(url, headers=headers, allow_redirects=False)
+            url_location = response.headers["location"]
+
+            # Authorize2: Get connector_session_key
+            response = session.get(url_location, headers=headers, allow_redirects=False)
+            url_location = response.headers["location"]
+            parsed_redirect = urlparse(url_location)
+            next_uri = parse_qs(parsed_redirect.query).get("next_uri")[0]
+            parsed_next_uri = urlparse(next_uri)
+            connector_session_key = parse_qs(parsed_next_uri.query).get(
+                "connector_session_key"
+            )[0]
+
+            # Authorize3
+            response = session.get(url_location, headers=headers, allow_redirects=False)
+
+            # Authorize: Get Code
+            url = (
+                self.LOGIN_FORM_HOST
+                + "/auth/api/v2/user/oauth2/authorize?client_id="
+                + self.CCSP_SERVICE_ID
+                + "&redirect_uri=https://"
+                + self.BASE_URL
+                + "/api/v1/user/oauth2/redirect&response_type=code&scope=&state=ccsp&connector_client_id=hmgid1.0-"
+                + self.CCSP_SERVICE_ID
+                + "&ui_locales=de&connector_scope=&connector_session_key="
+                + connector_session_key
+            )
+            response = session.get(url, headers=headers, allow_redirects=False)
+            url_location = response.headers["location"]
+            parsed_redirect = urlparse(url_location)
+            code = parse_qs(parsed_redirect.query).get("code")[0]
+
+            return code
+
+        else:
+            url = self.LOGIN_FORM_URL
+            headers = {"Content-type": "application/json"}
+            data = {"email": username, "password": password}
+            response = requests.get(url, headers=headers, cookies=cookies)
+            _LOGGER.debug(f"{DOMAIN} - Sign In Response: {response}")
+
+            url_redirect = response.url
+            connector_session_key = re.search(
+                r"connector_session_key%3D([0-9a-fA-F-]{36})", url_redirect
+            ).group(1)
+            url = self.LOGIN_FORM_HOST + "/auth/account/signin"
+            headers = {
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": self.LOGIN_FORM_HOST,
+            }
+            data = {
+                "client_id": self.CCSP_SERVICE_ID,
+                "encryptedPassword": "false",
+                "orgHmgSid": "",
+                "password": password,
+                "redirect_uri": "https://"
+                + self.BASE_DOMAIN
+                + ":8080/api/v1/user/oauth2/redirect",
+                "state": "ccsp",
+                "username": username,
+                "remember_me": "false",
+                "connector_session_key": connector_session_key,
+                "_csrf": "",
+            }
+
+            response = requests.post(
+                url, headers=headers, data=data, allow_redirects=False
+            )
+            location = response.headers["Location"]
+            code = parse_qs(urlparse(location).query).get("code")[0]
+
+            return code
 
     def _get_authorization_code_with_form(self, username, password, cookies) -> str:
         url = self.USER_API_URL + "integrationinfo"
@@ -1202,25 +1308,40 @@ class KiaUvoApiEU(ApiImplType1):
         return authorization_code
 
     def _get_access_token(self, stamp, authorization_code):
-        # Get Access Token #
-        url = self.USER_API_URL + "oauth2/token"
-        headers = {
-            "Authorization": self.BASIC_AUTHORIZATION,
-            "Stamp": stamp,
-            "Content-type": "application/x-www-form-urlencoded",
-            "Host": self.BASE_URL,
-            "Connection": "close",
-            "Accept-Encoding": "gzip, deflate",
-            "User-Agent": USER_AGENT_OK_HTTP,
-        }
+        if BRANDS[self.brand] == BRAND_HYUNDAI:
+            # Get Access Token #
+            url = self.USER_API_URL + "oauth2/token"
+            headers = {
+                "Authorization": self.BASIC_AUTHORIZATION,
+                "Stamp": stamp,
+                "Content-type": "application/x-www-form-urlencoded",
+                "Host": self.BASE_URL,
+                "Connection": "close",
+                "Accept-Encoding": "gzip, deflate",
+                "User-Agent": USER_AGENT_OK_HTTP,
+            }
 
-        data = (
-            "grant_type=authorization_code&redirect_uri=https%3A%2F%2F"
-            + self.BASE_DOMAIN
-            + "%3A8080%2Fapi%2Fv1%2Fuser%2Foauth2%2Fredirect&code="
-            + authorization_code
-        )
-        response = requests.post(url, data=data, headers=headers)
+            data = (
+                "grant_type=authorization_code&redirect_uri=https%3A%2F%2F"
+                + self.BASE_DOMAIN
+                + "%3A8080%2Fapi%2Fv1%2Fuser%2Foauth2%2Fredirect&code="
+                + authorization_code
+            )
+            response = requests.post(url, data=data, headers=headers)
+        else:
+            url = self.LOGIN_FORM_HOST + "/auth/api/v2/user/oauth2/token"
+            data = {
+                "grant_type": "authorization_code",
+                "code": authorization_code,
+                "redirect_uri": "https://"
+                + self.BASE_DOMAIN
+                + ":8080/api/v1/user/oauth2/redirect",
+                "client_id": self.CCSP_SERVICE_ID,
+                "client_secret": "secret",
+            }
+
+            response = requests.post(url, data=data, allow_redirects=False)
+
         response = response.json()
 
         token_type = response["token_type"]

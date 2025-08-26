@@ -381,7 +381,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             state, "vehicleStatus.evStatus.batteryPlugin"
         )
         vehicle.ev_charging_power = get_child_value(
-            state, "vehicleStatus.evStatus.batteryPower.batteryStndChrgPower"
+            state, "vehicleStatus.evStatus.batteryStndChrgPower"
         )
         ChargeDict = get_child_value(
             state, "vehicleStatus.evStatus.reservChargeInfos.targetSOClist"
@@ -686,9 +686,8 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                 ):
                     vehicle_location_result = self._get_vehicle_location(token, vehicle)
                 else:
-                    cached_location = state["vehicleStatus"]["vehicleLocation"]
                     _LOGGER.debug(
-                        f"{DOMAIN} - update_vehicle_with_cached_state keep Location fallback {cached_location}"  # noqa
+                        f"{DOMAIN} - update_vehicle_with_cached_state keep Location fallback"  # noqa
                     )
             else:
                 vehicle_location_result = self._get_vehicle_location(token, vehicle)
@@ -696,9 +695,8 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             if vehicle_location_result is not None:
                 state["vehicleStatus"]["vehicleLocation"] = vehicle_location_result
             else:
-                cached_location = state["vehicleStatus"]["vehicleLocation"]
                 _LOGGER.debug(
-                    f"{DOMAIN} - update_vehicle_with_cached_state Location fallback {cached_location}"  # noqa
+                    f"{DOMAIN} - update_vehicle_with_cached_state Location fallback"  # noqa
                 )
 
         self._update_vehicle_properties(vehicle, state)
