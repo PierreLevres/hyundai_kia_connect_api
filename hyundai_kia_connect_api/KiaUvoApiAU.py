@@ -6,45 +6,38 @@ import base64
 import datetime as dt
 import logging
 import random
+import typing as ty
 import uuid
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
-import pytz
 import requests
-from dateutil import tz
 
-from .ApiImplType1 import ApiImplType1
-from .Token import Token
-from .Vehicle import (
-    Vehicle,
-    DailyDrivingStats,
-    MonthTripInfo,
-    DayTripInfo,
-    TripInfo,
-    DayTripCounts,
-)
-from .ApiImplType1 import _check_response_for_errors
+from .ApiImplType1 import ApiImplType1, _check_response_for_errors
 from .const import (
     BRAND_HYUNDAI,
     BRAND_KIA,
     BRANDS,
-    REGIONS,
+    CHARGE_PORT_ACTION,
+    DISTANCE_UNITS,
     DOMAIN,
+    ENGINE_TYPES,
     REGION_AUSTRALIA,
     REGION_NZ,
-    DISTANCE_UNITS,
-    TEMPERATURE_UNITS,
+    REGIONS,
     SEAT_STATUS,
-    CHARGE_PORT_ACTION,
-    ENGINE_TYPES,
+    TEMPERATURE_UNITS,
 )
-from .exceptions import (
-    AuthenticationError,
-)
-from .utils import (
-    get_child_value,
-    get_hex_temp_into_index,
-    parse_datetime,
+from .exceptions import AuthenticationError
+from .Token import Token
+from .utils import get_child_value, get_hex_temp_into_index, parse_datetime
+from .Vehicle import (
+    DailyDrivingStats,
+    DayTripCounts,
+    DayTripInfo,
+    MonthTripInfo,
+    TripInfo,
+    Vehicle,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,7 +47,7 @@ USER_AGENT_MOZILLA: str = "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build
 
 
 class KiaUvoApiAU(ApiImplType1):
-    data_timezone = tz.gettz("Australia/Sydney")
+    data_timezone = ZoneInfo("Australia/Sydney")
     temperature_range = [x * 0.5 for x in range(34, 54)]
 
     def __init__(self, region: int, brand: int, language: str) -> None:
@@ -89,7 +82,13 @@ class KiaUvoApiAU(ApiImplType1):
         self.SPA_API_URL_V2: str = "https://" + self.BASE_URL + "/api/v2/spa/"
         self.CLIENT_ID: str = self.CCSP_SERVICE_ID
 
-    def login(self, username: str, password: str) -> Token:
+    def login(
+        self,
+        username: str,
+        password: str,
+        otp_handler: ty.Callable[[dict], dict] | None = None,
+        pin: str | None = None,
+    ) -> Token:
         stamp = self._get_stamp()
         device_id = self._get_device_id(stamp)
         cookies = self._get_cookies()
@@ -109,7 +108,7 @@ class KiaUvoApiAU(ApiImplType1):
             authorization_code, stamp
         )
         _, refresh_token = self._get_refresh_token(authorization_code, stamp)
-        valid_until = dt.datetime.now(pytz.utc) + dt.timedelta(hours=23)
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
 
         return Token(
             username=username,
@@ -118,6 +117,7 @@ class KiaUvoApiAU(ApiImplType1):
             refresh_token=refresh_token,
             device_id=device_id,
             valid_until=valid_until,
+            pin=pin,
         )
 
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
@@ -141,6 +141,17 @@ class KiaUvoApiAU(ApiImplType1):
         if is_ccs2:
             state = response["resMsg"]["state"]["Vehicle"]
             self._update_vehicle_properties_ccs2(vehicle, state)
+            # The CCS2 status response embeds a stale cached location.
+            # Override it with the more current /location/park endpoint.
+            location = self._get_location(token, vehicle)
+            if location and get_child_value(location, "coord.lat"):
+                vehicle.location = (
+                    get_child_value(location, "coord.lat"),
+                    get_child_value(location, "coord.lon"),
+                    parse_datetime(
+                        get_child_value(location, "time"), self.data_timezone
+                    ),
+                )
         else:
             location = self._get_location(token, vehicle)
             self._update_vehicle_properties(
@@ -173,15 +184,19 @@ class KiaUvoApiAU(ApiImplType1):
                 self._update_vehicle_drive_info(vehicle, state)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
-        status = self._get_forced_vehicle_state(token, vehicle)
-        location = self._get_location(token, vehicle)
-        self._update_vehicle_properties(
-            vehicle,
-            {
-                "status": status,
-                "vehicleLocation": location,
-            },
-        )
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        if is_ccs2:
+            self._force_refresh_vehicle_state_ccs2(token, vehicle)
+        else:
+            status = self._get_forced_vehicle_state(token, vehicle)
+            location = self._get_location(token, vehicle)
+            self._update_vehicle_properties(
+                vehicle,
+                {
+                    "status": status,
+                    "vehicleLocation": location,
+                },
+            )
         # Only call for driving info on cars we know have a chance of supporting it.
         # Could be expanded if other types do support it.
         if (
@@ -204,6 +219,28 @@ class KiaUvoApiAU(ApiImplType1):
                 )
             else:
                 self._update_vehicle_drive_info(vehicle, state)
+
+    def _force_refresh_vehicle_state_ccs2(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/ccs2/carstatus/latest"
+        response = requests.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+        _LOGGER.debug(
+            f"{DOMAIN} - Force refresh CCS2 vehicle status response: {response}"
+        )
+        _check_response_for_errors(response)
+        state = response["resMsg"]["state"]["Vehicle"]
+        self._update_vehicle_properties_ccs2(vehicle, state)
+        location = self._get_location(token, vehicle)
+        if location and get_child_value(location, "coord.lat"):
+            vehicle.location = (
+                get_child_value(location, "coord.lat"),
+                get_child_value(location, "coord.lon"),
+                parse_datetime(get_child_value(location, "time"), self.data_timezone),
+            )
 
     def _update_vehicle_properties(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "status.time"):
@@ -253,18 +290,18 @@ class KiaUvoApiAU(ApiImplType1):
         vehicle.side_mirror_heater_is_on = get_child_value(
             state, "status.sideMirrorHeat"
         )
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.flSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.frSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.is_locked = get_child_value(state, "status.doorLock")
         vehicle.front_left_door_is_open = get_child_value(
             state, "status.doorOpen.frontLeft"
@@ -846,7 +883,6 @@ class KiaUvoApiAU(ApiImplType1):
         _LOGGER.debug(f"{DOMAIN} - Get cookies request: {url}")
         session = requests.Session()
         _ = session.get(url)
-        _LOGGER.debug(f"{DOMAIN} - Get cookies response: {session.cookies.get_dict()}")
         return session.cookies.get_dict()
 
     def _get_authorization_code_with_redirect_url(

@@ -2,29 +2,29 @@
 
 # pylint:disable=logging-fstring-interpolation,deprecated-method,invalid-name,broad-exception-caught,unused-argument,missing-function-docstring
 
+import datetime as dt
 import logging
 import time
-import datetime as dt
-import pytz
-import requests
-import certifi
 
+import certifi
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 
-from hyundai_kia_connect_api.exceptions import APIError
+from hyundai_kia_connect_api.exceptions import APIError, AuthenticationError
 
-from .const import (
-    DOMAIN,
-    VEHICLE_LOCK_ACTION,
-    SEAT_STATUS,
-    DISTANCE_UNITS,
-    TEMPERATURE_UNITS,
-    ENGINE_TYPES,
-)
-from .utils import get_child_value, get_float, parse_datetime
 from .ApiImpl import ApiImpl, ClimateRequestOptions
+from .const import (
+    DISTANCE_UNITS,
+    DOMAIN,
+    ENGINE_TYPES,
+    ORDER_STATUS,
+    SEAT_STATUS,
+    TEMPERATURE_UNITS,
+    VEHICLE_LOCK_ACTION,
+)
 from .Token import Token
+from .utils import get_child_value, get_float, parse_datetime
 from .Vehicle import (
     DailyDrivingStats,
     DayTripCounts,
@@ -34,10 +34,66 @@ from .Vehicle import (
     Vehicle,
 )
 
-
 CIPHERS = "DEFAULT@SECLEVEL=1"
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _check_response_for_errors(response: dict) -> None:
+    """
+    Checks for errors in the API response.
+    If an error is found, an exception is raised.
+    Known values:
+    502: AuthenticationError - Incorrect username or password
+
+    :param response: the API's JSON response
+    """
+    error_code_mapping = {
+        "502": AuthenticationError,
+    }
+    if "errorCode" in response:
+        if response["errorCode"] in error_code_mapping:
+            raise error_code_mapping[response["errorCode"]](response["errorMessage"])
+        else:
+            raise APIError(
+                f"API Error {response['errorCode']}: {response['errorMessage']}"
+            )
+
+
+def _safe_parse_json(response, action_name: str):
+    """
+    Safely parse JSON response from Hyundai USA API.
+
+    Control commands (lock, unlock, climate, charge, etc.) return
+    HTTP 200 with an empty body on success. Calling response.json()
+    on an empty body raises JSONDecodeError even though the command
+    succeeded.
+
+    Args:
+        response: the HTTP response object
+        action_name: name of the action for logging purposes
+
+    Returns:
+        dict: parsed JSON if body exists
+        None: if body is empty (command succeeded, nothing to return)
+
+    Raises:
+        APIError: if HTTP status is not 200
+    """
+    if response.status_code != 200:
+        raise APIError(
+            f"{action_name} failed with "
+            f"HTTP {response.status_code}: '{response.text[:200]}'"
+        )
+
+    if not response.text.strip():
+        _LOGGER.debug(
+            f"{DOMAIN} - Empty response body for {action_name} "
+            f"(HTTP 200). Command succeeded."
+        )
+        return None
+
+    return response.json()
 
 
 class cipherAdapter(HTTPAdapter):
@@ -66,7 +122,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
     """HyundaiBlueLinkApiUSA"""
 
     # initialize with a timestamp which will allow the first fetch to occur
-    last_loc_timestamp = dt.datetime.now(pytz.utc) - dt.timedelta(hours=3)
+    last_loc_timestamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
 
     def __init__(self, region: int, brand: int, language: str):
         self.LANGUAGE: str = language
@@ -121,23 +177,37 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
     def _get_vehicle_headers(self, token: Token, vehicle: Vehicle) -> dict:
         headers = self._get_authenticated_headers(token)
         headers["registrationId"] = vehicle.id
-        headers["gen"] = vehicle.generation
+        headers["gen"] = str(vehicle.generation)
         headers["vin"] = vehicle.VIN
         return headers
 
-    def login(self, username: str, password: str) -> Token:
+    def login(
+        self,
+        username: str,
+        password: str,
+        pin: str | None = None,
+    ) -> Token:
         # Sign In with Email and Password and Get Authorization Code
         url = self.LOGIN_API + "oauth/token"
         data = {"username": username, "password": password}
 
         response = self.sessions.post(url, json=data, headers=self.API_HEADERS)
-        _LOGGER.debug(f"{DOMAIN} - Sign In Response {response.text}")
         response = response.json()
+        _check_response_for_errors(response)
+        if response.get("access_token") is None:
+            raise APIError(
+                "Error Code: "
+                + response.get("errorCode", "")
+                + " - Login failed: "
+                + response.get("errorMessage", "")
+            )
         access_token = response["access_token"]
         refresh_token = response["refresh_token"]
         expires_in = float(response["expires_in"])
 
-        valid_until = dt.datetime.now(pytz.utc) + dt.timedelta(seconds=expires_in)
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            seconds=expires_in
+        )
 
         return Token(
             username=username,
@@ -145,6 +215,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             access_token=access_token,
             refresh_token=refresh_token,
             valid_until=valid_until,
+            pin=pin,
         )
 
     def _get_vehicle_details(self, token: Token, vehicle: Vehicle):
@@ -153,6 +224,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         response = self.sessions.get(url, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Get Vehicles Response {response.text}")
         response = response.json()
+        _check_response_for_errors(response)
         for entry in response["enrolledVehicleDetails"]:
             entry = entry["vehicleDetails"]
             if entry["regid"] == vehicle.id:
@@ -169,6 +241,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         response = self.sessions.get(url, headers=headers)
         response = response.json()
+        _check_response_for_errors(response)
         _LOGGER.debug(f"{DOMAIN} - get_vehicle_status response {response}")
 
         status = dict(response["vehicleStatus"])
@@ -195,6 +268,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         response = self.sessions.get(url, headers=headers)
         response = response.json()
+        _check_response_for_errors(response)
         _LOGGER.debug(f"{DOMAIN} - get_ev_trip_details response {response}")
 
         return response
@@ -214,6 +288,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         try:
             response = self.sessions.get(url, headers=headers)
             response_json = response.json()
+            _check_response_for_errors(response_json)
             _LOGGER.debug(f"{DOMAIN} - Get Vehicle Location {response_json}")
             if response_json.get("coord") is not None:
                 return response_json
@@ -306,18 +381,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         vehicle.side_mirror_heater_is_on = get_child_value(
             state, "vehicleStatus.sideMirrorHeat"
         )
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.flSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.frSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.tire_pressure_rear_left_warning_is_on = bool(
             get_child_value(
                 state, "vehicleStatus.tirePressureLamp.tirePressureWarningLampRearLeft"
@@ -424,6 +499,32 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             get_child_value(state, "vehicleStatus.evStatus.remainTime2.etc3.value"),
             "m",
         )
+        if (
+            get_child_value(
+                state,
+                "lastVehicleInfo.vehicleStatusRpt.vehicleStatus.evStatus.v2xStatus",
+            )
+            is not None
+        ):
+            vehicle.ev_v2x_status = bool(
+                get_child_value(
+                    state,
+                    "lastVehicleInfo.vehicleStatusRpt.vehicleStatus.evStatus.v2xStatus",
+                )
+            )
+        if (
+            get_child_value(
+                state,
+                "lastVehicleInfo.vehicleStatusRpt.vehicleStatus.evStatus.v2lStatus",
+            )
+            is not None
+        ):
+            vehicle.ev_v2l_status = bool(
+                get_child_value(
+                    state,
+                    "lastVehicleInfo.vehicleStatusRpt.vehicleStatus.evStatus.v2lStatus",
+                )
+            )
         if get_child_value(
             state,
             "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.value",
@@ -725,6 +826,9 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         response = self.sessions.get(url, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Get Vehicles Response {response.text}")
         response = response.json()
+        _check_response_for_errors(response)
+        if "enrolledVehicleDetails" not in response:
+            raise AuthenticationError("Missing enrolledVehicleDetails in response")
         result = []
         for entry in response["enrolledVehicleDetails"]:
             entry = entry["vehicleDetails"]
@@ -742,13 +846,59 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                 registration_date=entry["enrollmentDate"],
                 timezone=self.data_timezone,
                 enabled=entry.get("enrollmentStatus") != "CANCELLED",
-                generation=entry.get("vehicleGeneration", 2),
+                generation=int(entry.get("vehicleGeneration", "2")),
             )
             result.append(vehicle)
 
         return result
 
-    def lock_action(self, token: Token, vehicle: Vehicle, action) -> None:
+    def _get_transaction_id(self, response) -> str | None:
+        for key in ("tmsTid", "transactionId", "Xid"):
+            if key in response.headers:
+                return response.headers[key]
+        _LOGGER.warning(
+            f"{DOMAIN} - No transaction ID found in response headers: "
+            f"{dict(response.headers)}"
+        )
+        return None
+
+    def check_action_status(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        action_id: str,
+        synchronous: bool = False,
+        timeout: int = 120,
+    ) -> ORDER_STATUS:
+        url = self.API_URL + "rmt/getRunningStatus"
+        headers = self._get_vehicle_headers(token, vehicle)
+        headers["tid"] = action_id
+        headers["login_id"] = token.username
+        headers["service_type"] = "REMOTE_POLL"
+
+        max_attempts = 1 if not synchronous else max(1, timeout // 2)
+
+        for _ in range(max_attempts):
+            response = self.sessions.post(url, headers=headers)
+            response_json = _safe_parse_json(response, "check_action_status")
+            if response_json is None:
+                if not synchronous:
+                    return ORDER_STATUS.UNKNOWN
+                time.sleep(2)
+                continue
+            status = response_json.get("status", "")
+            if status == "SUCCESS":
+                return ORDER_STATUS.SUCCESS
+            elif status == "ERROR":
+                return ORDER_STATUS.FAILED
+            if synchronous:
+                time.sleep(2)
+
+        if synchronous:
+            return ORDER_STATUS.TIMEOUT
+        return ORDER_STATUS.PENDING
+
+    def lock_action(self, token: Token, vehicle: Vehicle, action) -> str:
         _LOGGER.debug(f"{DOMAIN} - Action for lock is: {action}")
 
         if action == VEHICLE_LOCK_ACTION.LOCK:
@@ -765,15 +915,15 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         data = {"userName": token.username, "vin": vehicle.VIN}
         response = self.sessions.post(url, headers=headers, json=data)
-        # response_headers = response.headers
-        # response = response.json()
-        # action_status = self.check_action_status(token, headers["pAuth"], response_headers["transactionId"])  # noqa
-
-        # _LOGGER.debug(f"{DOMAIN} - Received lock_action response {action_status}")
+        response_json = _safe_parse_json(response, "lock_action")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Received lock_action response status code: {response.status_code}"  # noqa
         )
         _LOGGER.debug(f"{DOMAIN} - Received lock_action response: {response.text}")
+
+        return self._get_transaction_id(response)
 
     def start_climate(
         self, token: Token, vehicle: Vehicle, options: ClimateRequestOptions
@@ -842,12 +992,17 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         _LOGGER.debug(f"{DOMAIN} - Start engine data: {data}")
 
         response = self.sessions.post(url, json=data, headers=headers)
+        response_json = _safe_parse_json(response, "start_climate")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Start engine response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Start engine response: {response.text}")
 
-    def stop_climate(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def stop_climate(self, token: Token, vehicle: Vehicle) -> str:
         _LOGGER.debug(f"{DOMAIN} - Stop engine..")
 
         if vehicle.engine_type == ENGINE_TYPES.EV:
@@ -860,12 +1015,17 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         _LOGGER.debug(f"{DOMAIN} - Stop engine headers: {headers}")
 
         response = self.sessions.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "stop_climate")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Stop engine response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Stop engine response: {response.text}")
 
-    def start_charge(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def start_charge(self, token: Token, vehicle: Vehicle) -> str:
         if vehicle.engine_type != ENGINE_TYPES.EV:
             return {}
 
@@ -876,12 +1036,17 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         _LOGGER.debug(f"{DOMAIN} - Start charging headers: {headers}")
 
         response = self.sessions.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "start_charge")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Start charge response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Start charge response: {response.text}")
 
-    def stop_charge(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def stop_charge(self, token: Token, vehicle: Vehicle) -> str:
         if vehicle.engine_type != ENGINE_TYPES.EV:
             return {}
 
@@ -892,10 +1057,15 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         _LOGGER.debug(f"{DOMAIN} - Stop charging headers: {headers}")
 
         response = self.sessions.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "stop_charge")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Stop charge response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Stop charge response: {response.text}")
+
+        return self._get_transaction_id(response)
 
     def set_charge_limits(
         self, token: Token, vehicle: Vehicle, ac: int, dc: int
@@ -924,7 +1094,12 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         _LOGGER.debug(f"{DOMAIN} - Setting charge limits body: {data}")
 
         response = self.sessions.post(url, json=data, headers=headers)
+        response_json = _safe_parse_json(response, "set_charge_limits")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Setting charge limits response status code: {response.status_code}"  # noqa
         )
         _LOGGER.debug(f"{DOMAIN} - Setting charge limits: {response.text}")
+
+        return self._get_transaction_id(response)

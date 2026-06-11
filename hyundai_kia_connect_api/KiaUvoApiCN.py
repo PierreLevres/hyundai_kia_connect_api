@@ -3,31 +3,19 @@
 # pylint:disable=missing-timeout,missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation,broad-except,bare-except,super-init-not-called,unused-argument,line-too-long,too-many-lines
 
 import datetime as dt
-import math
 import logging
+import math
+import typing as ty
 import uuid
-from typing import Optional
 from time import sleep
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
-import pytz
 import requests
-from dateutil import tz
 
-from .ApiImpl import (
-    ClimateRequestOptions,
-)
+from .ApiImpl import ClimateRequestOptions
 from .ApiImplType1 import ApiImplType1
-
-from .Token import Token
-from .Vehicle import (
-    Vehicle,
-    DailyDrivingStats,
-    MonthTripInfo,
-    DayTripInfo,
-    TripInfo,
-    DayTripCounts,
-)
 from .const import (
     BRAND_HYUNDAI,
     BRAND_KIA,
@@ -43,20 +31,30 @@ from .const import (
     VEHICLE_LOCK_ACTION,
 )
 from .exceptions import (
+    APIError,
     AuthenticationError,
     DuplicateRequestError,
+    InvalidAPIResponseError,
+    NoDataFound,
+    RateLimitingError,
     RequestTimeoutError,
     ServiceTemporaryUnavailable,
-    NoDataFound,
-    InvalidAPIResponseError,
-    APIError,
-    RateLimitingError,
+    UnsupportedControlError,
 )
+from .Token import Token
 from .utils import (
     get_child_value,
-    get_index_into_hex_temp,
     get_hex_temp_into_index,
+    get_index_into_hex_temp,
     parse_datetime,
+)
+from .Vehicle import (
+    DailyDrivingStats,
+    DayTripCounts,
+    DayTripInfo,
+    MonthTripInfo,
+    TripInfo,
+    Vehicle,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,6 +84,7 @@ def _check_response_for_errors(response: dict) -> None:
 
     error_code_mapping = {
         "4004": DuplicateRequestError,
+        "4005": UnsupportedControlError,
         "4081": RequestTimeoutError,
         "5031": ServiceTemporaryUnavailable,
         "5091": RateLimitingError,
@@ -105,7 +104,7 @@ def _check_response_for_errors(response: dict) -> None:
 
 
 class KiaUvoApiCN(ApiImplType1):
-    data_timezone = tz.gettz("Asia/Shanghai")
+    data_timezone = ZoneInfo("Asia/Shanghai")
     temperature_range = [x * 0.5 for x in range(28, 60)]
 
     def __init__(self, region: int, brand: int, language: str) -> None:
@@ -157,7 +156,13 @@ class KiaUvoApiCN(ApiImplType1):
             "User-Agent": USER_AGENT_OK_HTTP,
         }
 
-    def login(self, username: str, password: str) -> Token:
+    def login(
+        self,
+        username: str,
+        password: str,
+        otp_handler: ty.Callable[[dict], dict] | None = None,
+        pin: str | None = None,
+    ) -> Token:
         device_id = self._get_device_id()
         cookies = self._get_cookies()
         self._set_session_language(cookies)
@@ -174,7 +179,7 @@ class KiaUvoApiCN(ApiImplType1):
 
         _, access_token, authorization_code = self._get_access_token(authorization_code)
         _, refresh_token = self._get_refresh_token(authorization_code)
-        valid_until = dt.datetime.now(pytz.utc) + LOGIN_TOKEN_LIFETIME
+        valid_until = dt.datetime.now(dt.timezone.utc) + LOGIN_TOKEN_LIFETIME
 
         return Token(
             username=username,
@@ -183,6 +188,7 @@ class KiaUvoApiCN(ApiImplType1):
             refresh_token=refresh_token,
             device_id=device_id,
             valid_until=valid_until,
+            pin=pin,
         )
 
     def get_vehicles(self, token: Token) -> list[Vehicle]:
@@ -253,9 +259,13 @@ class KiaUvoApiCN(ApiImplType1):
                 self._update_vehicle_drive_info(vehicle, state)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
-        state = self._get_forced_vehicle_state(token, vehicle)
-        state["vehicleLocation"] = self._get_location(token, vehicle)
-        self._update_vehicle_properties(vehicle, state)
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        if is_ccs2:
+            self._force_refresh_vehicle_state_ccs2(token, vehicle)
+        else:
+            state = self._get_forced_vehicle_state(token, vehicle)
+            state["vehicleLocation"] = self._get_location(token, vehicle)
+            self._update_vehicle_properties(vehicle, state)
         # Only call for driving info on cars we know have a chance of supporting it.
         # Could be expanded if other types do support it.
         if vehicle.engine_type == ENGINE_TYPES.EV:
@@ -274,6 +284,28 @@ class KiaUvoApiCN(ApiImplType1):
                 )
             else:
                 self._update_vehicle_drive_info(vehicle, state)
+
+    def _force_refresh_vehicle_state_ccs2(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/ccs2/carstatus/latest"
+        response = requests.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+        _LOGGER.debug(
+            f"{DOMAIN} - Force refresh CCS2 vehicle status response: {response}"
+        )
+        _check_response_for_errors(response)
+        state = response["resMsg"]
+        self._update_vehicle_properties(vehicle, state)
+        location = self._get_location(token, vehicle)
+        if location and get_child_value(location, "coord.lat"):
+            vehicle.location = (
+                get_child_value(location, "coord.lat"),
+                get_child_value(location, "coord.lon"),
+                parse_datetime(get_child_value(location, "time"), self.data_timezone),
+            )
 
     def _update_vehicle_properties(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "status.time"):
@@ -324,18 +356,18 @@ class KiaUvoApiCN(ApiImplType1):
         vehicle.side_mirror_heater_is_on = get_child_value(
             state, "status.sideMirrorHeat"
         )
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.flSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.frSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "status.seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.is_locked = get_child_value(state, "status.doorLock")
         vehicle.front_left_door_is_open = get_child_value(
             state, "status.doorOpen.frontLeft"
@@ -1036,7 +1068,6 @@ class KiaUvoApiCN(ApiImplType1):
         _LOGGER.debug(f"{DOMAIN} - Get cookies request: {url}")
         session = requests.Session()
         _ = session.get(url)
-        _LOGGER.debug(f"{DOMAIN} - Get cookies response: {session.cookies.get_dict()}")
         return session.cookies.get_dict()
         # return session
 
@@ -1056,7 +1087,6 @@ class KiaUvoApiCN(ApiImplType1):
         response = requests.post(
             url, json=data, headers=headers, cookies=cookies
         ).json()
-        _LOGGER.debug(f"{DOMAIN} - Sign In Response: {response}")
         parsed_url = urlparse(response["redirectUrl"])
         authorization_code = "".join(parse_qs(parsed_url.query)["code"])
         return authorization_code
@@ -1080,15 +1110,12 @@ class KiaUvoApiCN(ApiImplType1):
             + "%3A443%2Fapi%2Fv1%2Fuser%2Foauth2%2Fredirect&code="
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Data: {headers}{data}")
         response = requests.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Response: {response}")
 
         token_type = response["token_type"]
         access_token = token_type + " " + response["access_token"]
         authorization_code = response["refresh_token"]
-        _LOGGER.debug(f"{DOMAIN} - Access Token Value {access_token}")
         return token_type, access_token, authorization_code
 
     def _get_refresh_token(self, authorization_code):
@@ -1107,10 +1134,8 @@ class KiaUvoApiCN(ApiImplType1):
             "grant_type=refresh_token&redirect_uri=https%3A%2F%2Fwww.getpostman.com%2Foauth2%2Fcallback&refresh_token="  # noqa
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Data: {data}")
         response = requests.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Response: {response}")
         token_type = response["token_type"]
         refresh_token = token_type + " " + response["access_token"]
         return token_type, refresh_token
@@ -1126,10 +1151,8 @@ class KiaUvoApiCN(ApiImplType1):
         }
 
         data = {"deviceId": token.device_id, "pin": token.pin}
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Data: {data}")
         response = requests.put(url, json=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Response {response}")
         control_token = "Bearer " + response["controlToken"]
         control_token_expire_at = math.floor(
             dt.datetime.now().timestamp() + response["expiresTime"]

@@ -3,33 +3,21 @@
 # pylint:disable=missing-timeout,missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation,broad-except,bare-except,super-init-not-called,unused-argument,line-too-long,too-many-lines
 
 import base64
-import random
 import datetime as dt
 import logging
-import uuid
-import re
 import math
-from urllib.parse import parse_qs, urlparse
+import random
+import re
+import typing as ty
+import uuid
 from typing import Optional
-import pytz
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
+
 import requests
-from dateutil import tz
-from .ApiImpl import (
-    ClimateRequestOptions,
-)
 
-from .ApiImplType1 import ApiImplType1
-from .ApiImplType1 import _check_response_for_errors
-
-from .Token import Token
-from .Vehicle import (
-    Vehicle,
-    DailyDrivingStats,
-    MonthTripInfo,
-    DayTripInfo,
-    TripInfo,
-    DayTripCounts,
-)
+from .ApiImpl import ClimateRequestOptions
+from .ApiImplType1 import ApiImplType1, _check_response_for_errors
 from .const import (
     BRAND_HYUNDAI,
     BRAND_KIA,
@@ -40,16 +28,19 @@ from .const import (
     ENGINE_TYPES,
     SEAT_STATUS,
     TEMPERATURE_UNITS,
-    VEHICLE_LOCK_ACTION,
     VALET_MODE_ACTION,
+    VEHICLE_LOCK_ACTION,
 )
-from .exceptions import (
-    AuthenticationError,
-)
-from .utils import (
-    get_child_value,
-    get_index_into_hex_temp,
-    get_hex_temp_into_index,
+from .exceptions import AuthenticationError
+from .Token import Token
+from .utils import get_child_value, get_hex_temp_into_index, get_index_into_hex_temp
+from .Vehicle import (
+    DailyDrivingStats,
+    DayTripCounts,
+    DayTripInfo,
+    MonthTripInfo,
+    TripInfo,
+    Vehicle,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -78,7 +69,7 @@ SUPPORTED_LANGUAGES_LIST = [
 
 
 class KiaUvoApiIN(ApiImplType1):
-    data_timezone = tz.gettz("Asia/Kolkata")
+    data_timezone = ZoneInfo("Asia/Kolkata")
     temperature_range = [x * 0.5 for x in range(28, 60)]
 
     def __init__(self, brand: int) -> None:
@@ -131,7 +122,13 @@ class KiaUvoApiIN(ApiImplType1):
             "User-Agent": USER_AGENT_OK_HTTP,
         }
 
-    def login(self, username: str, password: str) -> Token:
+    def login(
+        self,
+        username: str,
+        password: str,
+        otp_handler: ty.Callable[[dict], dict] | None = None,
+        pin: str | None = None,
+    ) -> Token:
         stamp = self._get_stamp()
         device_id = self._get_device_id(stamp)
         cookies = self._get_cookies()
@@ -150,7 +147,7 @@ class KiaUvoApiIN(ApiImplType1):
             stamp, authorization_code
         )
         _, refresh_token = self._get_refresh_token(stamp, authorization_code)
-        valid_until = dt.datetime.now(pytz.utc) + dt.timedelta(hours=23)
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
 
         return Token(
             username=username,
@@ -159,6 +156,7 @@ class KiaUvoApiIN(ApiImplType1):
             refresh_token=refresh_token,
             device_id=device_id,
             valid_until=valid_until,
+            pin=pin,
         )
 
     def get_vehicles(self, token: Token) -> list[Vehicle]:
@@ -222,6 +220,10 @@ class KiaUvoApiIN(ApiImplType1):
 
         self._update_vehicle_location(vehicle, state)
 
+        if vehicle.engine_type == ENGINE_TYPES.EV:
+            charge = self._get_charge_limits(token, vehicle)
+            self._update_vehicle_properties_charge(vehicle, charge)
+
     def _update_vehicle_maintenance_alert(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "odometer"):
             vehicle.odometer = (get_child_value(state, "odometer"), DISTANCE_UNITS[1])
@@ -245,9 +247,13 @@ class KiaUvoApiIN(ApiImplType1):
             )
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
-        state = self._get_forced_vehicle_state(token, vehicle)
-        state["vehicleLocation"] = self._get_location(token, vehicle)
-        self._update_vehicle_properties(vehicle, state)
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        if is_ccs2:
+            self._force_refresh_vehicle_state_ccs2(token, vehicle)
+        else:
+            state = self._get_forced_vehicle_state(token, vehicle)
+            state["vehicleLocation"] = self._get_location(token, vehicle)
+            self._update_vehicle_properties(vehicle, state)
         # Only call for driving info on cars we know have a chance of supporting it.
         # Could be expanded if other types do support it.
         if (
@@ -255,6 +261,9 @@ class KiaUvoApiIN(ApiImplType1):
             or vehicle.engine_type == ENGINE_TYPES.PHEV
         ):
             try:
+                charge = self._get_charge_limits(token, vehicle)
+                self._update_vehicle_properties_charge(vehicle, charge)
+
                 state = self._get_driving_info(token, vehicle)
             except Exception as e:
                 # we don't know if all car types provide this information.
@@ -269,6 +278,23 @@ class KiaUvoApiIN(ApiImplType1):
                 )
             else:
                 self._update_vehicle_drive_info(vehicle, state)
+
+    def _force_refresh_vehicle_state_ccs2(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/ccs2/carstatus/latest"
+        response = requests.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+        _LOGGER.debug(
+            f"{DOMAIN} - Force refresh CCS2 vehicle status response: {response}"
+        )
+        _check_response_for_errors(response)
+        state = response["resMsg"]
+        self._update_vehicle_properties(vehicle, state)
+        location = self._get_location(token, vehicle)
+        self._update_vehicle_location(vehicle, location)
 
     def _update_vehicle_properties(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "time"):
@@ -302,18 +328,18 @@ class KiaUvoApiIN(ApiImplType1):
             vehicle.steering_wheel_heater_is_on = True
 
         vehicle.back_window_heater_is_on = get_child_value(state, "sideBackWindowHeat")
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.astSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.drvSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.is_locked = get_child_value(state, "doorLock")
         vehicle.front_left_door_is_open = get_child_value(state, "doorOpen.frontLeft")
         vehicle.front_right_door_is_open = get_child_value(state, "doorOpen.frontRight")
@@ -358,6 +384,51 @@ class KiaUvoApiIN(ApiImplType1):
                 DISTANCE_UNITS[get_child_value(state, "dte.unit")],
             )
 
+        vehicle.washer_fluid_warning_is_on = get_child_value(state, "washerFluidStatus")
+        vehicle.accessory_on = bool(get_child_value(state, "acc"))
+        vehicle.ign3 = bool(get_child_value(state, "ign3"))
+        vehicle.transmission_condition = bool(get_child_value(state, "transCond"))
+        vehicle.sleep_mode_check = bool(get_child_value(state, "sleepModeCheck"))
+        vehicle.headlamp_status = bool(
+            get_child_value(state, "lampWireStatus.headLamp.headLampStatus")
+        )
+        vehicle.headlamp_left_low = bool(
+            get_child_value(state, "lampWireStatus.headLamp.leftLowLamp")
+        )
+        vehicle.headlamp_right_low = bool(
+            get_child_value(state, "lampWireStatus.headLamp.rightLowLamp")
+        )
+        vehicle.headlamp_left_high = bool(
+            get_child_value(state, "lampWireStatus.headLamp.leftHighLamp")
+        )
+        vehicle.headlamp_right_high = bool(
+            get_child_value(state, "lampWireStatus.headLamp.rightHighLamp")
+        )
+        vehicle.headlamp_left_bifunc = bool(
+            get_child_value(state, "lampWireStatus.headLamp.leftBifuncLamp")
+        )
+        vehicle.headlamp_right_bifunc = bool(
+            get_child_value(state, "lampWireStatus.headLamp.rightBifuncLamp")
+        )
+        vehicle.stop_lamp_left = bool(
+            get_child_value(state, "lampWireStatus.stopLamp.leftLamp")
+        )
+        vehicle.stop_lamp_right = bool(
+            get_child_value(state, "lampWireStatus.stopLamp.rightLamp")
+        )
+        vehicle.turn_signal_left_front = bool(
+            get_child_value(state, "lampWireStatus.turnSignalLamp.leftFrontLamp")
+        )
+        vehicle.turn_signal_right_front = bool(
+            get_child_value(state, "lampWireStatus.turnSignalLamp.rightFrontLamp")
+        )
+        vehicle.turn_signal_left_rear = bool(
+            get_child_value(state, "lampWireStatus.turnSignalLamp.leftRearLamp")
+        )
+        vehicle.turn_signal_right_rear = bool(
+            get_child_value(state, "lampWireStatus.turnSignalLamp.rightRearLamp")
+        )
+
         vehicle.brake_fluid_warning_is_on = get_child_value(state, "breakOilStatus")
         vehicle.fuel_level = get_child_value(state, "fuelLevel")
         vehicle.fuel_level_is_low = get_child_value(state, "lowFuelLight")
@@ -365,6 +436,80 @@ class KiaUvoApiIN(ApiImplType1):
         vehicle.smart_key_battery_warning_is_on = get_child_value(
             state, "smartKeyBatteryWarning"
         )
+
+        if (
+            get_child_value(
+                state,
+                "evStatus",
+            )
+            is not None
+        ):
+            vehicle.ev_battery_percentage = get_child_value(
+                state, "evStatus.batteryStatus"
+            )
+            vehicle.ev_battery_is_charging = get_child_value(
+                state, "evStatus.batteryCharge"
+            )
+            vehicle.ev_battery_is_plugged_in = get_child_value(
+                state, "evStatus.batteryPlugin"
+            )
+
+            vehicle.ev_estimated_current_charge_duration = (
+                get_child_value(state, "evStatus.remainTime2.atc.value"),
+                "m",
+            )
+            vehicle.ev_estimated_fast_charge_duration = (
+                get_child_value(state, "evStatus.remainTime2.etc1.value"),
+                "m",
+            )
+            vehicle.ev_estimated_portable_charge_duration = (
+                get_child_value(state, "evStatus.remainTime2.etc2.value"),
+                "m",
+            )
+            vehicle.ev_estimated_station_charge_duration = (
+                get_child_value(state, "evStatus.remainTime2.etc3.value"),
+                "m",
+            )
+
+            vehicle.ev_driving_range = (
+                round(
+                    float(
+                        get_child_value(
+                            state,
+                            "evStatus.drvDistance.0.rangeByFuel.evModeRange.value",
+                        )
+                    ),
+                    1,
+                ),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "evStatus.drvDistance.0.rangeByFuel.evModeRange.unit",
+                    )
+                ],
+            )
+
+            vehicle.total_driving_range = (
+                round(
+                    float(
+                        get_child_value(
+                            state,
+                            "evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.value",
+                        )
+                    ),
+                    1,
+                ),
+                DISTANCE_UNITS[
+                    get_child_value(
+                        state,
+                        "evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.unit",
+                    )
+                ],
+            )
+            vehicle.sunroof_is_open = get_child_value(state, "sunroofOpen")
+            vehicle.ev_charge_port_door_is_open = bool(
+                get_child_value(state, "chargePortDoorOpenStatus")
+            )
 
         vehicle.data = state
 
@@ -480,6 +625,7 @@ class KiaUvoApiIN(ApiImplType1):
             "options": {
                 "defrost": options.defrost,
                 "heating1": int(options.heating),
+                "igniOnDuration": options.duration,
             },
             "tempCode": hex_set_temp,
             "unit": "C",
@@ -535,6 +681,17 @@ class KiaUvoApiIN(ApiImplType1):
         token.device_id = self._get_device_id(self._get_stamp())
         return response["msgId"]
 
+    def _update_vehicle_properties_charge(self, vehicle: Vehicle, state: dict) -> None:
+        try:
+            if isinstance(state.get("targetSOClist"), list):
+                for item in state["targetSOClist"]:
+                    if item["plugType"] == 0:
+                        vehicle.ev_charge_limits_dc = item["targetSOClevel"]
+                    elif item["plugType"] == 1:
+                        vehicle.ev_charge_limits_ac = item["targetSOClevel"]
+        except Exception:
+            _LOGGER.debug(f"{DOMAIN} - SOC Levels couldn't be found. May not be an EV.")
+
     def _get_charge_limits(self, token: Token, vehicle: Vehicle) -> dict:
         # Not currently used as value is in the general get.
         # Most likely this forces the car the update it.
@@ -581,6 +738,50 @@ class KiaUvoApiIN(ApiImplType1):
         _check_response_for_errors(response)
         return response
 
+    # The "/tripinfo" API in Bluelink India does not provide complete trip info. It just returns the summary info. Instead, it uses the "/tripinfo/detail" API to fetch the trip details.
+    # PS: Since I have tested in Hyundai EV vehicle only, have added check to use the API only for EV vehicles. Can remove the check based on testing on non-EV vehicles
+    def _get_detailed_trip_info(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        date_string: str,
+        trip: dict,
+    ) -> dict:
+        if (
+            vehicle.engine_type != ENGINE_TYPES.EV
+            or BRANDS[self.brand] != BRAND_HYUNDAI
+        ):
+            return None
+
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/tripinfo/detail"
+        payload = {
+            "tripPeriodType": 1,
+            "setTripDay": date_string,
+            "setTripStartTime": trip["tripStartTime"],
+            "setServiceTID": trip["serviceTID"],
+            "tripStartTime": trip["tripStartTime"],
+            "tripEndTime": trip["tripEndTime"],
+        }
+        response = requests.post(
+            url,
+            json=payload,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        )
+        response = response.json()
+        tripinfo = response["resMsg"]["tripInfo"]
+        processed_trip = TripInfo(
+            hhmmss=trip["tripStartTime"][8:],
+            drive_time=tripinfo["tripDrvTime"],
+            idle_time=tripinfo["tripIdleTime"],
+            distance=tripinfo["tripDist"],
+            avg_speed=tripinfo["tripAvgSpeed"],
+            max_speed=tripinfo["tripMaxSpeed"],
+        )
+
+        return processed_trip
+
     def update_month_trip_info(
         self,
         token,
@@ -603,7 +804,7 @@ class KiaUvoApiIN(ApiImplType1):
             0,  # month trip info
         )
         msg = json_result["resMsg"]
-        if msg["monthTripDayCnt"] > 0:
+        if msg.get("monthTripDayCnt", 0) > 0 or len(msg.get("tripDayList", [])) > 0:
             result = MonthTripInfo(
                 yyyymm=yyyymm_string,
                 day_list=[],
@@ -661,14 +862,21 @@ class KiaUvoApiIN(ApiImplType1):
                 ),
             )
             for trip in msg["tripList"]:
-                processed_trip = TripInfo(
-                    hhmmss=trip["tripTime"],
-                    drive_time=trip["tripDrvTime"],
-                    idle_time=trip["tripIdleTime"],
-                    distance=trip["tripDist"],
-                    avg_speed=trip["tripAvgSpeed"],
-                    max_speed=trip["tripMaxSpeed"],
-                )
+                # Hyundai EVs do not provide full trip info. Used "/tripinfo/detail" API instead
+                if "tripTime" in trip:
+                    processed_trip = TripInfo(
+                        hhmmss=trip["tripTime"],
+                        drive_time=trip["tripDrvTime"],
+                        idle_time=trip["tripIdleTime"],
+                        distance=trip["tripDist"],
+                        avg_speed=trip["tripAvgSpeed"],
+                        max_speed=trip["tripMaxSpeed"],
+                    )
+                else:
+                    processed_trip = self._get_detailed_trip_info(
+                        token, vehicle, yyyymmdd_string, trip
+                    )
+
                 result.trip_list.append(processed_trip)
 
             vehicle.day_trip_info = result
@@ -812,9 +1020,7 @@ class KiaUvoApiIN(ApiImplType1):
         _LOGGER.debug(f"{DOMAIN} - Get cookies request: {url}")
         session = requests.Session()
         _ = session.get(url)
-        _LOGGER.debug(f"{DOMAIN} - Get cookies response: {session.cookies.get_dict()}")
         return session.cookies.get_dict()
-        # return session
 
     def _get_authorization_code_with_redirect_url(
         self, username, password, cookies
@@ -849,15 +1055,12 @@ class KiaUvoApiIN(ApiImplType1):
             + "%3A8080%2Fapi%2Fv1%2Fuser%2Foauth2%2Fredirect&code="
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Data: {headers}{data}")
         response = requests.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Response: {response}")
 
         token_type = response["token_type"]
         access_token = token_type + " " + response["access_token"]
         authorization_code = response["refresh_token"]
-        _LOGGER.debug(f"{DOMAIN} - Access Token Value {access_token}")
         return token_type, access_token, authorization_code
 
     def get_last_updated_at(self, value) -> dt.datetime:
@@ -896,10 +1099,8 @@ class KiaUvoApiIN(ApiImplType1):
             "grant_type=refresh_token&redirect_uri=https%3A%2F%2Fwww.getpostman.com%2Foauth2%2Fcallback&refresh_token="  # noqa
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Data: {data}")
         response = requests.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Response: {response}")
         token_type = response["token_type"]
         refresh_token = token_type + " " + response["access_token"]
         return token_type, refresh_token
@@ -915,10 +1116,8 @@ class KiaUvoApiIN(ApiImplType1):
         }
 
         data = {"deviceId": token.device_id, "pin": token.pin}
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Data: {data}")
         response = requests.put(url, json=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Response {response}")
         control_token = "Bearer " + response["controlToken"]
         control_token_expire_at = math.floor(
             dt.datetime.now().timestamp() + response["expiresTime"]

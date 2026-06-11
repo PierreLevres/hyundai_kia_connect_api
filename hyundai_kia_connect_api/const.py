@@ -22,8 +22,9 @@ REGION_USA = "USA"
 REGION_CHINA = "China"
 REGION_AUSTRALIA = "Australia"
 REGION_NZ = "New Zealand"
-
 REGION_INDIA = "India"
+REGION_BRAZIL = "Brazil"
+
 REGIONS = {
     1: REGION_EUROPE,
     2: REGION_CANADA,
@@ -32,6 +33,7 @@ REGIONS = {
     5: REGION_AUSTRALIA,
     6: REGION_INDIA,
     7: REGION_NZ,
+    8: REGION_BRAZIL,
 }
 
 LOGIN_TOKEN_LIFETIME = datetime.timedelta(hours=23)
@@ -114,3 +116,8 @@ class WINDOW_STATE(IntEnum):
 class VALET_MODE_ACTION(Enum):
     ACTIVATE = "activate"
     DEACTIVATE = "deactivate"
+
+
+class OTP_NOTIFY_TYPE(Enum):
+    EMAIL = "EMAIL"
+    SMS = "SMS"

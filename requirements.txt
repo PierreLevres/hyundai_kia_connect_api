@@ -1,6 +1,5 @@
-beautifulsoup4>=4.10.0
-curlify>=2.2.1
-python-dateutil
-pytz>=2021.3
-certifi>=2024.6.2
-geopy >= 2.2.0
+beautifulsoup4>=4.15.0
+requests
+certifi>=2026.5.20
+tzdata>=2026.2
+pycryptodome>=3.23.0

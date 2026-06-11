@@ -18,6 +18,7 @@ long_description = readme
 
 test_requirements = [
     "pytest>=3",
+    "syrupy>=4.0.0",
 ]
 
 setup(
@@ -25,14 +26,21 @@ setup(
     author_email="fuatakgun@gmail.com",
     python_requires=">=3.10",
     classifiers=[
-        "Development Status :: 2 - Pre-Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Natural Language :: English",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
     ],
-    description="Python Boilerplate contains all the boilerplate you need to create a Python package.",
+    description="Python API for Hyundai, Kia, and Genesis car infotainment systems",
     install_requires=requirements,
+    extras_require={
+        "google": ["geopy>=2.2.0"],
+    },
     license="MIT license",
     long_description=long_description,
     include_package_data=True,
@@ -47,6 +55,6 @@ setup(
     test_suite="tests",
     tests_require=test_requirements,
     url="https://github.com/Hyundai-Kia-Connect/hyundai_kia_connect_api",
-    version="3.44.5",
+    version="4.15.2",
     zip_safe=False,
 )

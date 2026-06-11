@@ -27,6 +27,14 @@ class AuthenticationError(HyundaiKiaException):
     pass
 
 
+class AuthenticationOTPRequired(AuthenticationError):
+    """
+    Raised when OTP is required for authentication.
+    """
+
+    pass
+
+
 class APIError(HyundaiKiaException):
     """
     Generic API error
@@ -77,6 +85,15 @@ class DuplicateRequestError(APIError):
     pass
 
 
+class UnsupportedControlError(APIError):
+    """
+    Raised when the vehicle does not support the requested control action.
+    API returns resCode 4005 for unsupported actions (e.g. stop_climate on HEV).
+    """
+
+    pass
+
+
 class RequestTimeoutError(APIError):
     """
     Raised when (supposedly) the server fails to establish a connection with the car.
@@ -88,6 +105,17 @@ class RequestTimeoutError(APIError):
 class InvalidAPIResponseError(APIError):
     """
     Raised upon receipt of an invalid API response.
+    """
+
+    pass
+
+
+class ConsentRequiredError(AuthenticationError):
+    """
+    Raised when the OAuth signin succeeds but the user must accept
+    a consent/authorization page before tokens can be issued.
+    This typically means the user needs to log in via a browser once
+    to accept terms, then use the refresh token going forward.
     """
 
     pass

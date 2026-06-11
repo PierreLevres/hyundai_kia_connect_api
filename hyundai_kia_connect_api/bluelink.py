@@ -3,6 +3,7 @@
 """Connects to the Bluelink API and query the vehicle."""
 
 import argparse
+import dataclasses
 import datetime
 import json
 import logging
@@ -12,6 +13,13 @@ import textwrap
 
 import hyundai_kia_connect_api
 from hyundai_kia_connect_api import const
+
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if dataclasses.is_dataclass(o):
+            return dataclasses.asdict(o)
+        return super().default(o)
 
 
 def print_vehicle(vehicle):
@@ -193,7 +201,12 @@ def print_vehicle(vehicle):
     print("  month_trip_info:", vehicle.month_trip_info)
     print("  day_trip_info:", vehicle.day_trip_info)
     print("Debug")
-    print(textwrap.indent(json.dumps(vehicle.data, indent=2, sort_keys=True), " "))
+    print(
+        textwrap.indent(
+            json.dumps(vehicle.data, indent=2, sort_keys=True, cls=EnhancedJSONEncoder),
+            " ",
+        )
+    )
 
 
 def vehicle_to_dict(vehicle):
@@ -447,7 +460,6 @@ def main():
         geocode_api_enable=True,
         geocode_api_use_email=True,
     )
-    # TODO: Cache token.
     vm.check_and_refresh_token()
     vm.update_all_vehicles_with_cached_state()
     return args.func(vm, args)

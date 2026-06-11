@@ -3,6 +3,29 @@
 
 import datetime
 import re
+from enum import IntEnum
+from typing import Optional, TypeVar
+
+
+T = TypeVar("T", bound=IntEnum)
+
+
+def to_int_enum(enum_class: type[T], value: str | int | T | None) -> T | None:
+    """Convert string, int, or existing IntEnum to the specified IntEnum type.
+
+    Handles "1" -> 1 -> WINDOW_STATE.OPEN conversions.
+    Returns None if value is None.
+    """
+    if value is None:
+        return None
+    if isinstance(value, enum_class):
+        return value
+    try:
+        # Convert string to int if needed
+        int_value = int(value) if isinstance(value, str) else value
+        return enum_class(int_value)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid {enum_class.__name__} value: {value}") from e
 
 
 def get_child_value(data, key):
@@ -92,3 +115,64 @@ def get_safe_local_datetime(date: datetime) -> datetime:
     if date is not None and hasattr(date, "tzinfo") and date.tzinfo is not None:
         date = date.astimezone()
     return date
+
+
+def detect_timezone_for_date(
+    date: datetime.datetime,
+    ref_date: datetime.datetime,
+    timezones: list[datetime.timezone],
+) -> Optional[datetime.timezone]:
+    """
+    Guess an appropriate timezone given a date with an unknown timezone and a
+    nearby reference time in any valid timezone.
+    """
+    for tz in timezones:
+        delta = (ref_date - date.replace(tzinfo=tz)).total_seconds()
+        # Timezones differing by half an hour exist, 20 minutes should hopefully
+        # be enough to cover clock skew and API processing times.
+        if abs(delta) < 20 * 60:
+            return tz
+    return None
+
+
+def parse_date_br(date_string: str, tz: datetime.timezone) -> datetime.datetime:
+    """Parse date string in format YYYYMMDD or YYYYMMDDHHMMSS to datetime.
+
+    Used by Brazilian API to parse date strings.
+
+    Args:
+        date_string: Date string in format YYYYMMDD or YYYYMMDDHHMMSS
+        tz: Timezone to apply to the parsed datetime
+
+    Returns:
+        Parsed datetime object with timezone, or None if parsing fails
+    """
+    if not date_string:
+        return None
+
+    # Try full datetime format first (YYYYMMDDHHMMSS)
+    if len(date_string) >= 14:
+        m = re.match(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", date_string)
+        if m:
+            return datetime.datetime(
+                year=int(m.group(1)),
+                month=int(m.group(2)),
+                day=int(m.group(3)),
+                hour=int(m.group(4)),
+                minute=int(m.group(5)),
+                second=int(m.group(6)),
+                tzinfo=tz,
+            )
+
+    # Try date only format (YYYYMMDD)
+    if len(date_string) >= 8:
+        m = re.match(r"(\d{4})(\d{2})(\d{2})", date_string)
+        if m:
+            return datetime.datetime(
+                year=int(m.group(1)),
+                month=int(m.group(2)),
+                day=int(m.group(3)),
+                tzinfo=tz,
+            )
+
+    return None
